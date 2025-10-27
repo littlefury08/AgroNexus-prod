@@ -4,7 +4,6 @@ import cors from "cors";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
-import chatRoutes from "./routes/chat.js";
 import { Server } from "socket.io";
 import http from "http";
 import path from "path";
@@ -16,16 +15,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.use("/api", chatRoutes);
-
 const JWT_SECRET = process.env.JWT_SECRET || "claveultrasecreeta123";
 const JWT_EXPIRES = process.env.JWT_EXPIRES || "2h";
 
 const dbConfig = {
-  host: "localhost",
-  user: "root",
-  password: "",
-  database: "agronexus",
+  host: process.env.MYSQL_ADDON_HOST,
+  user: process.env.MYSQL_ADDON_USER,
+  password: process.env.MYSQL_ADDON_PASSWORD,
+  database: process.env.MYSQL_ADDON_DB,
 };
 
 const pool = mysql.createPool({
@@ -67,7 +64,7 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:3000",
+    origin: process.env.URL_FRONTEND || "http://localhost:3000",
     methods: ["GET", "POST"],
   },
 });
@@ -147,27 +144,6 @@ async function userHasTerrenoWriteAccess(userId, terrenoId) {
   return false;
 }
 
-async function getChatRoom(chatId) {
-  const [rows] = await pool.execute(
-    "SELECT * FROM chat_room WHERE id = ? LIMIT 1",
-    [chatId]
-  );
-  return rows.length ? rows[0] : null;
-}
-
-async function isChatAdmin(userId, chatId) {
-  const room = await getChatRoom(chatId);
-  if (!room) return false;
-  if (room.creado_por === userId) return true;
-  if (room.tipo === "grupo" && room.grupo_id) {
-    return await isGrupoAdmin(userId, room.grupo_id);
-  }
-  if (room.tipo === "terreno" && room.terreno_id) {
-    return await isTerrenoOwner(userId, room.terreno_id);
-  }
-  return false;
-}
-
 app.get("/api/alertas", authenticateToken, async (req, res) => {
   try {
     const { terrenoId, sensorId } = req.query;
@@ -215,6 +191,260 @@ app.get("/api/mis-terrenos", authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("❌ Error obteniendo terrenos:", err.message);
     res.status(500).json({ success: false, message: "Error en el servidor" });
+  }
+});
+
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) {
+    console.warn("❌ Socket rechazado: no hay token");
+    return next(new Error("Token requerido"));
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      console.warn("❌ Socket rechazado: token inválido");
+      return next(new Error("Token inválido"));
+    }
+    socket.user = user;
+    next();
+  });
+});
+
+app.post("/api/chat/rooms", authenticateToken, async (req, res) => {
+  try {
+    const {
+      tipo,
+      titulo,
+      participantes = [],
+      grupo_id = null,
+      terreno_id = null,
+    } = req.body;
+    const creado_por = req.user.id;
+    const [r] = await pool.execute(
+      "INSERT INTO chat_room (tipo, grupo_id, terreno_id, creado_por, titulo, fecha_creacion) VALUES (?, ?, ?, ?, ?, NOW())",
+      [tipo, grupo_id || null, terreno_id || null, creado_por, titulo || null]
+    );
+    const roomId = r.insertId;
+
+    const vals = [];
+    for (const u of participantes) {
+      vals.push([roomId, u, "viewer"]);
+    }
+    vals.push([roomId, creado_por, "admin"]);
+    if (vals.length) {
+      await pool.query(
+        "INSERT INTO chat_participante (room_id, usuario_id, rol) VALUES ?",
+        [vals]
+      );
+    }
+
+    res.json({ success: true, id: roomId });
+  } catch (err) {
+    console.error("Error crear sala:", err);
+    res.status(500).json({ success: false, message: "Error interno" });
+  }
+});
+
+app.get("/api/chat/rooms", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const [rows] = await pool.execute(
+      `SELECT cr.*, cp.rol
+       FROM chat_room cr
+       JOIN chat_participante cp ON cr.id = cp.room_id
+       WHERE cp.usuario_id = ?
+       ORDER BY cr.fecha_creacion DESC`,
+      [userId]
+    );
+    res.json({ success: true, rooms: rows });
+  } catch (err) {
+    console.error("Error listar salas:", err);
+    res.status(500).json({ success: false, message: "Error interno" });
+  }
+});
+
+app.get("/api/chat/rooms/:id/messages", authenticateToken, async (req, res) => {
+  try {
+    const roomId = req.params.id;
+    const limit = parseInt(req.query.limit || "50");
+    const offset = parseInt(req.query.offset || "0");
+
+    const [ok] = await pool.execute(
+      "SELECT id FROM chat_participante WHERE room_id = ? AND usuario_id = ? LIMIT 1",
+      [roomId, req.user.id]
+    );
+    if (!ok.length)
+      return res.status(403).json({ success: false, message: "No autorizado" });
+
+    const [msgs] = await pool.execute(
+      `SELECT cm.id, cm.room_id, cm.autor_id, cm.contenido, cm.leido, cm.fecha_envio, u.nombre, u.apellido
+       FROM chat_mensaje cm
+       LEFT JOIN usuario u ON cm.autor_id = u.id
+       WHERE cm.room_id = ?
+       ORDER BY cm.fecha_envio DESC
+       LIMIT ? OFFSET ?`,
+      [roomId, limit, offset]
+    );
+    res.json({ success: true, mensajes: msgs.reverse() });
+  } catch (err) {
+    console.error("Error obtener mensajes:", err);
+    res.status(500).json({ success: false, message: "Error interno" });
+  }
+});
+
+app.post(
+  "/api/chat/rooms/:id/messages",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const roomId = req.params.id;
+      const { contenido } = req.body;
+      if (!contenido)
+        return res
+          .status(400)
+          .json({ success: false, message: "Contenido requerido" });
+
+      const [ok] = await pool.execute(
+        "SELECT rol FROM chat_participante WHERE room_id = ? AND usuario_id = ? LIMIT 1",
+        [roomId, req.user.id]
+      );
+      if (!ok.length)
+        return res
+          .status(403)
+          .json({ success: false, message: "No autorizado" });
+
+      const [r] = await pool.execute(
+        "INSERT INTO chat_mensaje (room_id, autor_id, contenido, leido, fecha_envio) VALUES (?, ?, ?, 0, NOW())",
+        [roomId, req.user.id, contenido]
+      );
+      const id = r.insertId;
+
+      const [[mensaje]] = await pool.execute(
+        `SELECT cm.id, cm.room_id, cm.autor_id, cm.contenido, cm.leido, cm.fecha_envio, u.nombre, u.apellido
+       FROM chat_mensaje cm LEFT JOIN usuario u ON cm.autor_id = u.id
+       WHERE cm.id = ? LIMIT 1`,
+        [id]
+      );
+
+      io.to(String(roomId)).emit("nuevoMensaje", mensaje);
+
+      res.json({ success: true, mensaje });
+    } catch (err) {
+      console.error("Error enviar mensaje:", err);
+      res.status(500).json({ success: false, message: "Error interno" });
+    }
+  }
+);
+
+app.post(
+  "/api/chat/rooms/:id/participants",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const roomId = req.params.id;
+      const { usuario_id, rol = "viewer" } = req.body;
+      const [r] = await pool.execute(
+        "SELECT rol FROM chat_participante WHERE room_id = ? AND usuario_id = ? LIMIT 1",
+        [roomId, req.user.id]
+      );
+      if (!r.length || r[0].rol !== "admin")
+        return res
+          .status(403)
+          .json({ success: false, message: "Solo admin puede agregar" });
+
+      await pool.execute(
+        "INSERT INTO chat_participante (room_id, usuario_id, rol) VALUES (?, ?, ?)",
+        [roomId, usuario_id, rol]
+      );
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error agregar participante:", err);
+      if (err && err.code === "ER_DUP_ENTRY")
+        return res
+          .status(400)
+          .json({ success: false, message: "Usuario ya es participante" });
+      res.status(500).json({ success: false, message: "Error interno" });
+    }
+  }
+);
+
+app.put(
+  "/api/chat/rooms/:id/participants/:usuarioId",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const roomId = req.params.id;
+      const usuarioId = req.params.usuarioId;
+      const { rol } = req.body;
+
+      const [r] = await pool.execute(
+        "SELECT rol FROM chat_participante WHERE room_id = ? AND usuario_id = ? LIMIT 1",
+        [roomId, req.user.id]
+      );
+      if (!r.length || r[0].rol !== "admin")
+        return res
+          .status(403)
+          .json({ success: false, message: "Solo admin puede cambiar roles" });
+
+      await pool.execute(
+        "UPDATE chat_participante SET rol = ? WHERE room_id = ? AND usuario_id = ?",
+        [rol, roomId, usuarioId]
+      );
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error cambiar rol:", err);
+      res.status(500).json({ success: false, message: "Error interno" });
+    }
+  }
+);
+
+app.delete(
+  "/api/chat/rooms/:id/participants/:usuarioId",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const roomId = req.params.id;
+      const usuarioId = req.params.usuarioId;
+
+      const [r] = await pool.execute(
+        "SELECT rol FROM chat_participante WHERE room_id = ? AND usuario_id = ? LIMIT 1",
+        [roomId, req.user.id]
+      );
+      if (!r.length || r[0].rol !== "admin")
+        return res
+          .status(403)
+          .json({ success: false, message: "Solo admin puede eliminar" });
+
+      await pool.execute(
+        "DELETE FROM chat_participante WHERE room_id = ? AND usuario_id = ?",
+        [roomId, usuarioId]
+      );
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error eliminar participante:", err);
+      res.status(500).json({ success: false, message: "Error interno" });
+    }
+  }
+);
+
+app.delete("/api/chat/rooms/:id", authenticateToken, async (req, res) => {
+  try {
+    const roomId = req.params.id;
+    const [r] = await pool.execute(
+      "SELECT rol FROM chat_participante WHERE room_id = ? AND usuario_id = ? LIMIT 1",
+      [roomId, req.user.id]
+    );
+    if (!r.length || r[0].rol !== "admin")
+      return res
+        .status(403)
+        .json({ success: false, message: "Solo admin puede eliminar la sala" });
+
+    await pool.execute("DELETE FROM chat_room WHERE id = ?", [roomId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Error eliminar sala:", err);
+    res.status(500).json({ success: false, message: "Error interno" });
   }
 });
 
@@ -375,6 +605,20 @@ app.get("/api/perfil", authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("❌ Error al obtener perfil:", err);
     res.status(500).json({ error: "Error en el servidor" });
+  }
+});
+
+app.put("/api/perfil", authenticateToken, async (req, res) => {
+  try {
+    const { nombre, apellido, email } = req.body;
+    await pool.execute(
+      "UPDATE usuario SET nombre=?, apellido=?, email=? WHERE id=?",
+      [nombre, apellido, email, req.user.id]
+    );
+    res.json({ success: true, message: "Perfil actualizado" });
+  } catch (error) {
+    console.error("Error actualizando perfil:", error);
+    res.status(500).json({ success: false, message: "Error en el servidor" });
   }
 });
 
@@ -834,209 +1078,6 @@ app.delete(
   }
 );
 
-app.post("/api/chats", authenticateToken, async (req, res) => {
-  try {
-    console.log("📥 Body recibido en /api/chats:", req.body);
-
-    const { tipo, participantes, titulo } = req.body;
-
-    if (!tipo) {
-      return res.status(400).json({
-        success: false,
-        error: "El campo 'tipo' es obligatorio (directo o grupo)",
-      });
-    }
-
-    if (!Array.isArray(participantes)) {
-      return res.status(400).json({
-        success: false,
-        error: "El campo 'participantes' debe ser un array con IDs de usuarios",
-      });
-    }
-
-    if (participantes.length < 1) {
-      return res.status(400).json({
-        success: false,
-        error: "Debe incluir al menos un participante",
-      });
-    }
-
-    if (tipo === "directo" && participantes.includes(req.user.id)) {
-      return res.status(400).json({
-        success: false,
-        error: "No puedes crear un chat directo contigo mismo",
-      });
-    }
-
-    if (tipo === "directo" && participantes.length === 1) {
-      const otroId = participantes[0];
-
-      const [rows] = await pool.query(
-        `SELECT c.id 
-         FROM chat c
-         JOIN chat_miembro cm1 ON c.id = cm1.chat_id
-         JOIN chat_miembro cm2 ON c.id = cm2.chat_id
-         WHERE c.tipo = 'directo'
-           AND cm1.usuario_id = ?
-           AND cm2.usuario_id = ?`,
-        [req.user.id, otroId]
-      );
-
-      if (rows.length > 0) {
-        return res.json({
-          success: true,
-          chat: { id: rows[0].id, tipo: "directo" },
-          duplicated: true,
-        });
-      }
-    }
-
-    const [result] = await pool.query(
-      "INSERT INTO chat (tipo, titulo, creado_por) VALUES (?, ?, ?)",
-      [tipo, titulo || null, req.user.id]
-    );
-
-    const chatId = result.insertId;
-
-    const miembros = [req.user.id, ...participantes];
-    for (const uid of miembros) {
-      await pool.query(
-        "INSERT INTO chat_miembro (chat_id, usuario_id) VALUES (?, ?)",
-        [chatId, uid]
-      );
-    }
-
-    res.json({
-      success: true,
-      chat: { id: chatId, tipo, titulo },
-      duplicated: false,
-    });
-  } catch (err) {
-    console.error("❌ Error creando chat:", err.message);
-    res
-      .status(500)
-      .json({ success: false, error: "Error interno del servidor" });
-  }
-});
-
-app.post("/api/chats", authenticateToken, async (req, res) => {
-  try {
-    const { tipo, titulo, grupo_id, terreno_id, participantes } = req.body;
-    const [result] = await pool.execute(
-      "INSERT INTO chat_room (tipo, grupo_id, terreno_id, creado_por, titulo, fecha_creacion) VALUES (?,?,?,?,?,NOW())",
-      [tipo, grupo_id || null, terreno_id || null, req.user.id, titulo || null]
-    );
-    const roomId = result.insertId;
-
-    const toInsert = new Set();
-
-    toInsert.add(req.user.id);
-
-    if (tipo === "grupo" && grupo_id) {
-      const [members] = await pool.execute(
-        "SELECT usuario_id FROM grupo_miembro WHERE grupo_id = ?",
-        [grupo_id]
-      );
-      members.forEach((m) => toInsert.add(m.usuario_id));
-    } else if (tipo === "terreno" && terreno_id) {
-      const [t] = await pool.execute(
-        "SELECT propietario_id FROM terreno WHERE id = ? LIMIT 1",
-        [terreno_id]
-      );
-      if (t.length) toInsert.add(t[0].propietario_id);
-
-      const [direct] = await pool.execute(
-        "SELECT usuario_id FROM terreno_miembro WHERE terreno_id = ?",
-        [terreno_id]
-      );
-      direct.forEach((d) => toInsert.add(d.usuario_id));
-
-      const [grupos] = await pool.execute(
-        "SELECT grupo_id FROM grupo_terreno WHERE terreno_id = ?",
-        [terreno_id]
-      );
-      for (const g of grupos) {
-        const [m] = await pool.execute(
-          "SELECT usuario_id FROM grupo_miembro WHERE grupo_id = ?",
-          [g.grupo_id]
-        );
-        m.forEach((x) => toInsert.add(x.usuario_id));
-      }
-    } else if (tipo === "directo" && Array.isArray(participantes)) {
-      participantes.forEach((p) => toInsert.add(p));
-    }
-
-    const inserts = [];
-    for (const uid of toInsert) inserts.push([roomId, uid, new Date()]);
-    if (inserts.length) {
-      await pool.query(
-        "INSERT INTO chat_participante (room_id, usuario_id, fecha_union) VALUES ?",
-        [inserts]
-      );
-    }
-  } catch (error) {
-    console.error("❌ Error creando chat:", error.message);
-    try {
-      res
-        .status(500)
-        .json({ success: false, message: "Error interno creando chat" });
-    } catch (e) {
-      console.error(e);
-      res
-        .status(500)
-        .json({ success: false, message: "Error interno creando chat" });
-    }
-  }
-});
-
-app.get("/api/chats/:id/participantes", authenticateToken, async (req, res) => {
-  try {
-    const roomId = req.params.id;
-    const [rows] = await pool.execute(
-      `SELECT cp.usuario_id, u.nombre, u.apellido, cp.fecha_union
-       FROM chat_participante cp
-       LEFT JOIN usuario u ON cp.usuario_id = u.id
-       WHERE cp.room_id = ?`,
-      [roomId]
-    );
-    res.json({ success: true, participantes: rows });
-  } catch (error) {
-    console.error("❌ Error listando participantes:", error.message);
-    res
-      .status(500)
-      .json({ success: false, message: "Error interno del servidor" });
-  }
-});
-
-app.post(
-  "/api/chats/:id/participantes",
-  authenticateToken,
-  async (req, res) => {
-    try {
-      const roomId = req.params.id;
-      if (!(await isChatAdmin(req.user.id, roomId)))
-        return res
-          .status(403)
-          .json({ success: false, message: "No autorizado" });
-      const { usuario_id } = req.body;
-      await pool.execute(
-        "INSERT INTO chat_participante (room_id, usuario_id, fecha_union) VALUES (?,?,NOW())",
-        [roomId, usuario_id]
-      );
-      res.json({ success: true });
-    } catch (error) {
-      console.error("❌ Error agregando participante:", error.message);
-      if (error && error.code === "ER_DUP_ENTRY")
-        return res
-          .status(400)
-          .json({ success: false, message: "Usuario ya es participante" });
-      res
-        .status(500)
-        .json({ success: false, message: "Error interno del servidor" });
-    }
-  }
-);
-
 app.get("/api/usuarios/buscar", authenticateToken, async (req, res) => {
   try {
     const q = (req.query.q || "").trim();
@@ -1128,242 +1169,6 @@ app.delete(
     }
   }
 );
-app.delete(
-  "/api/chats/:id/participantes/:usuarioId",
-  authenticateToken,
-  async (req, res) => {
-    try {
-      const roomId = req.params.id;
-      if (!(await isChatAdmin(req.user.id, roomId)))
-        return res
-          .status(403)
-          .json({ success: false, message: "No autorizado" });
-      await pool.execute(
-        "DELETE FROM chat_participante WHERE room_id=? AND usuario_id=?",
-        [roomId, req.params.usuarioId]
-      );
-      res.json({ success: true });
-    } catch (error) {
-      console.error(
-        "❌ Error eliminando participante del chat:",
-        error.message
-      );
-      res
-        .status(500)
-        .json({ success: false, message: "Error interno del servidor" });
-    }
-  }
-);
-app.get("/api/chats/:id/mensajes", authenticateToken, async (req, res) => {
-  try {
-    const [rows] = await pool.execute(
-      `SELECT cm.id, cm.contenido, cm.fecha_envio, u.id as autor_id, u.nombre, u.apellido
-       FROM chat_mensaje cm
-       LEFT JOIN usuario u ON cm.autor_id = u.id
-       WHERE cm.room_id = ?
-       ORDER BY cm.fecha_envio ASC`,
-      [req.params.id]
-    );
-    res.json({ success: true, mensajes: rows });
-  } catch (error) {
-    console.error("❌ Error obteniendo mensajes:", error.message);
-    res
-      .status(500)
-      .json({ success: false, message: "Error interno del servidor" });
-  }
-});
-
-app.post(
-  "/api/chats/:id/mensajes",
-  authenticateToken,
-  upload.single("archivo"),
-  async (req, res) => {
-    try {
-      const { contenido } = req.body;
-      const chatId = req.params.id;
-      const archivo = req.file ? req.file.filename : null;
-
-      if (!contenido && !archivo) {
-        return res
-          .status(400)
-          .json({ success: false, message: "Debe enviar contenido o archivo" });
-      }
-
-      const [result] = await pool.query(
-        "INSERT INTO mensajes (chat_id, remitente_id, contenido, archivo) VALUES (?,?,?,?)",
-        [chatId, req.user.id, contenido || null, archivo]
-      );
-
-      res.json({
-        success: true,
-        id: result.insertId,
-        contenido,
-        archivo,
-      });
-    } catch (err) {
-      console.error("❌ Error enviando mensaje:", err);
-      res
-        .status(500)
-        .json({ success: false, message: "Error enviando mensaje" });
-    }
-  }
-);
-app.post(
-  "/api/chats/:id/mensajes/archivo",
-  authenticateToken,
-  upload.single("archivo"),
-  async (req, res) => {
-    try {
-      const roomId = req.params.id;
-      const [p] = await pool.execute(
-        "SELECT 1 FROM chat_participante WHERE room_id=? AND usuario_id=? LIMIT 1",
-        [roomId, req.user.id]
-      );
-      if (!p.length) {
-        if (req.file) {
-        }
-        return res.status(403).json({
-          success: false,
-          message: "No eres participante de este chat",
-        });
-      }
-
-      if (!req.file) {
-        return res
-          .status(400)
-          .json({ success: false, message: "Archivo requerido" });
-      }
-
-      const filename = req.file.filename;
-
-      await pool.execute(
-        "INSERT INTO chat_mensaje (room_id, autor_id, contenido, fecha_envio, tipo, archivo) VALUES (?,?,?,?,?,?)",
-        [roomId, req.user.id, null, new Date(), "archivo", filename]
-      );
-
-      const [rows] = await pool.execute(
-        `SELECT cm.id, cm.tipo, cm.archivo, cm.fecha_envio as fecha, u.id as autor_id, u.nombre as usuario_nombre, u.apellido
-       FROM chat_mensaje cm
-       LEFT JOIN usuario u ON cm.autor_id = u.id
-       WHERE cm.id = LAST_INSERT_ID() LIMIT 1`
-      );
-
-      const mensaje = rows.length
-        ? {
-            id: rows[0].id,
-            tipo: rows[0].tipo,
-            archivo: rows[0].archivo,
-            fecha: rows[0].fecha,
-            autor_id: rows[0].autor_id,
-            usuario_nombre: `${rows[0].usuario_nombre} ${
-              rows[0].apellido || ""
-            }`.trim(),
-            esMio: req.user.id === rows[0].autor_id,
-          }
-        : null;
-
-      if (mensaje) {
-        io.to(roomId.toString()).emit("nuevoMensaje", mensaje);
-      }
-
-      res.json({ success: true, mensaje });
-    } catch (error) {
-      console.error("❌ Error subiendo archivo:", error);
-      res
-        .status(500)
-        .json({ success: false, message: "Error subiendo archivo" });
-    }
-  }
-);
-
-app.post("/api/chats", authenticateToken, async (req, res) => {
-  try {
-    const { tipo, titulo, grupo_id, terreno_id, participantes } = req.body;
-
-    if (
-      tipo === "directo" &&
-      Array.isArray(participantes) &&
-      participantes.length === 1
-    ) {
-      const otroUsuarioId = participantes[0];
-
-      const [rows] = await pool.execute(
-        `SELECT cr.id
-         FROM chat_room cr
-         INNER JOIN chat_participante cp1 ON cr.id = cp1.room_id
-         INNER JOIN chat_participante cp2 ON cr.id = cp2.room_id
-         WHERE cr.tipo = 'directo'
-           AND cp1.usuario_id = ?
-           AND cp2.usuario_id = ?
-         LIMIT 1`,
-        [req.user.id, otroUsuarioId]
-      );
-
-      if (rows.length > 0) {
-        return res.json({ success: true, chatId: rows[0].id, existente: true });
-      }
-    }
-
-    const [result] = await pool.execute(
-      "INSERT INTO chat_room (tipo, grupo_id, terreno_id, creado_por, titulo, fecha_creacion) VALUES (?,?,?,?,?,NOW())",
-      [tipo, grupo_id || null, terreno_id || null, req.user.id, titulo || null]
-    );
-    const roomId = result.insertId;
-
-    const toInsert = new Set();
-    toInsert.add(req.user.id);
-
-    if (tipo === "grupo" && grupo_id) {
-      const [members] = await pool.execute(
-        "SELECT usuario_id FROM grupo_miembro WHERE grupo_id = ?",
-        [grupo_id]
-      );
-      members.forEach((m) => toInsert.add(m.usuario_id));
-    } else if (tipo === "terreno" && terreno_id) {
-      const [t] = await pool.execute(
-        "SELECT propietario_id FROM terreno WHERE id = ? LIMIT 1",
-        [terreno_id]
-      );
-      if (t.length) toInsert.add(t[0].propietario_id);
-
-      const [direct] = await pool.execute(
-        "SELECT usuario_id FROM terreno_miembro WHERE terreno_id = ?",
-        [terreno_id]
-      );
-      direct.forEach((d) => toInsert.add(d.usuario_id));
-
-      const [grupos] = await pool.execute(
-        "SELECT grupo_id FROM grupo_terreno WHERE terreno_id = ?",
-        [terreno_id]
-      );
-      for (const g of grupos) {
-        const [m] = await pool.execute(
-          "SELECT usuario_id FROM grupo_miembro WHERE grupo_id = ?",
-          [g.grupo_id]
-        );
-        m.forEach((x) => toInsert.add(x.usuario_id));
-      }
-    } else if (tipo === "directo" && Array.isArray(participantes)) {
-      participantes.forEach((p) => toInsert.add(p));
-    }
-
-    const inserts = [];
-    for (const uid of toInsert) inserts.push([roomId, uid, new Date()]);
-    if (inserts.length) {
-      await pool.query(
-        "INSERT INTO chat_participante (room_id, usuario_id, fecha_union) VALUES ?",
-        [inserts]
-      );
-    }
-
-    res.json({ success: true, chatId: roomId, existente: false });
-  } catch (error) {
-    console.error("❌ Error creando chat:", error.message);
-    res
-      .status(500)
-      .json({ success: false, message: "Error interno creando chat" });
-  }
-});
 
 app.get("/api/sensores", authenticateToken, async (req, res) => {
   try {
@@ -1619,6 +1424,654 @@ app.get("/api/usuario/sensores-datos", authenticateToken, async (req, res) => {
       .status(500)
       .json({ success: false, message: "Error interno del servidor" });
   }
+});
+
+app.post("/api/chats", authenticateToken, async (req, res) => {
+  const { userId, nombre, tipo, participantes = [] } = req.body;
+  const userActualId = req.user.id;
+
+  console.log("🆕 POST /api/chats - Datos:", {
+    userId,
+    nombre,
+    tipo,
+    participantes,
+    userActualId,
+  });
+
+  try {
+    if (userId) {
+      console.log(
+        "🔍 Verificando chat directo existente entre",
+        userActualId,
+        "y",
+        userId
+      );
+
+      const [existente] = await pool.query(
+        `SELECT cr.id, cr.tipo, cr.titulo, cr.creado_por, cr.fecha_creacion
+         FROM chat_room cr
+         JOIN chat_participante cp1 ON cp1.room_id = cr.id
+         JOIN chat_participante cp2 ON cp2.room_id = cr.id
+         WHERE cp1.usuario_id = ? AND cp2.usuario_id = ? AND cr.tipo = 'directo'
+         LIMIT 1`,
+        [userActualId, userId]
+      );
+
+      if (existente.length > 0) {
+        console.log("✅ Chat directo ya existe:", existente[0].id);
+
+        const [[otroUsuario]] = await pool.query(
+          "SELECT id, nombre, apellido FROM usuario WHERE id = ?",
+          [userId]
+        );
+
+        return res.json({
+          chat: {
+            id: existente[0].id,
+            nombre: existente[0].titulo || "Chat Directo",
+            titulo: existente[0].titulo || "Chat Directo",
+            tipo: existente[0].tipo,
+            creado_por: existente[0].creado_por,
+            fecha_creacion: existente[0].fecha_creacion,
+            otro_usuario: otroUsuario,
+          },
+          yaExistia: true,
+        });
+      }
+
+      console.log("➡️ No existe, creando nuevo chat directo");
+    }
+
+    const tipoChat = tipo || (userId ? "directo" : "grupo");
+    const nombreChat = nombre || (userId ? "Chat Directo" : "Nuevo Grupo");
+
+    console.log("📝 Insertando chat_room:", {
+      tipoChat,
+      userActualId,
+      nombreChat,
+    });
+
+    const [result] = await pool.query(
+      "INSERT INTO chat_room (tipo, creado_por, titulo, fecha_creacion) VALUES (?, ?, ?, NOW())",
+      [tipoChat, userActualId, nombreChat]
+    );
+    const roomId = result.insertId;
+
+    console.log("✅ chat_room creado con ID:", roomId);
+
+    console.log("➕ Agregando usuario actual como admin");
+    await pool.query(
+      "INSERT INTO chat_participante (room_id, usuario_id, rol, fecha_union) VALUES (?, ?, 'admin', NOW())",
+      [roomId, userActualId]
+    );
+
+    if (userId) {
+      console.log("➕ Agregando usuario destino:", userId);
+      await pool.query(
+        "INSERT INTO chat_participante (room_id, usuario_id, rol, fecha_union) VALUES (?, ?, 'miembro', NOW())",
+        [roomId, userId]
+      );
+
+      const [[otroUsuario]] = await pool.query(
+        "SELECT id, nombre, apellido FROM usuario WHERE id = ?",
+        [userId]
+      );
+
+      const chatCreado = {
+        id: roomId,
+        nombre: nombreChat,
+        titulo: nombreChat,
+        tipo: tipoChat,
+        creado_por: userActualId,
+        fecha_creacion: new Date(),
+        otro_usuario: otroUsuario,
+      };
+
+      console.log("✅ Chat directo creado:", chatCreado);
+      return res.json({ chat: chatCreado });
+    }
+
+    if (tipoChat === "grupo" && participantes.length > 0) {
+      console.log(
+        "➕ Agregando",
+        participantes.length,
+        "participantes al grupo"
+      );
+      for (const pId of participantes) {
+        await pool.query(
+          "INSERT INTO chat_participante (room_id, usuario_id, rol, fecha_union) VALUES (?, ?, 'miembro', NOW())",
+          [roomId, pId]
+        );
+      }
+    }
+
+    const chatCreado = {
+      id: roomId,
+      nombre: nombreChat,
+      titulo: nombreChat,
+      tipo: tipoChat,
+      creado_por: userActualId,
+      fecha_creacion: new Date(),
+    };
+
+    console.log("✅ Chat creado exitosamente:", chatCreado);
+    res.json({ chat: chatCreado });
+  } catch (err) {
+    console.error("❌ Error al crear chat:", err);
+    console.error("❌ Stack:", err.stack);
+    res.status(500).json({
+      error: "Error al crear chat",
+      details: err.message,
+    });
+  }
+});
+
+app.get("/api/chats", authenticateToken, async (req, res) => {
+  const userActualId = req.user.id;
+
+  console.log("📋 GET /api/chats - Usuario:", userActualId);
+
+  try {
+    const [chats] = await pool.query(
+      `SELECT cr.id, cr.tipo, cr.titulo as nombre, cr.creado_por, cr.fecha_creacion
+       FROM chat_room cr
+       JOIN chat_participante cp ON cp.room_id = cr.id
+       WHERE cp.usuario_id = ?
+       ORDER BY cr.id DESC`,
+      [userActualId]
+    );
+
+    for (let chat of chats) {
+      if (chat.tipo === "directo") {
+        const [participantes] = await pool.query(
+          `SELECT u.id, u.nombre, u.apellido 
+           FROM chat_participante cp
+           JOIN usuario u ON cp.usuario_id = u.id
+           WHERE cp.room_id = ? AND cp.usuario_id != ?`,
+          [chat.id, userActualId]
+        );
+
+        if (participantes.length > 0) {
+          chat.otro_usuario = participantes[0];
+        }
+      }
+    }
+
+    console.log(`✅ ${chats.length} chats encontrados`);
+    res.json({ chats });
+  } catch (err) {
+    console.error("❌ Error al obtener chats:", err);
+    res
+      .status(500)
+      .json({ error: "Error al obtener chats", details: err.message });
+  }
+});
+
+app.put("/api/chats/:id", authenticateToken, async (req, res) => {
+  const { nombre } = req.body;
+  const { id } = req.params;
+  const userActualId = req.user.id;
+
+  console.log("✏️ PUT /api/chats/:id - Editando:", {
+    id,
+    nombre,
+    userActualId,
+  });
+
+  try {
+    const [check] = await pool.query(
+      "SELECT * FROM chat_room WHERE id = ? AND creado_por = ?",
+      [id, userActualId]
+    );
+
+    if (check.length === 0) {
+      console.log("⚠️ Sin permisos");
+      return res.status(403).json({ error: "Sin permisos" });
+    }
+
+    await pool.query("UPDATE chat_room SET titulo = ? WHERE id = ?", [
+      nombre,
+      id,
+    ]);
+    console.log("✅ Chat actualizado");
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Error al editar chat:", err);
+    res.status(500).json({ error: "Error al editar chat" });
+  }
+});
+
+app.delete("/api/chats/:id", authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const userActualId = req.user.id;
+
+  console.log("🗑️ DELETE /api/chats/:id - Eliminando:", { id, userActualId });
+
+  try {
+    const [chatInfo] = await pool.query(
+      "SELECT tipo, creado_por FROM chat_room WHERE id = ?",
+      [id]
+    );
+
+    if (chatInfo.length === 0) {
+      return res.status(404).json({ error: "Chat no encontrado" });
+    }
+
+    const chat = chatInfo[0];
+
+    if (chat.tipo === "grupo" && chat.creado_por !== userActualId) {
+      console.log("⚠️ Sin permisos - Solo el creador puede eliminar el grupo");
+      return res
+        .status(403)
+        .json({ error: "Solo el creador puede eliminar el grupo" });
+    }
+
+    if (chat.tipo === "directo") {
+      const [permiso] = await pool.query(
+        "SELECT * FROM chat_participante WHERE room_id = ? AND usuario_id = ?",
+        [id, userActualId]
+      );
+
+      if (permiso.length === 0) {
+        return res.status(403).json({ error: "No eres parte de este chat" });
+      }
+
+      await pool.query(
+        "DELETE FROM chat_participante WHERE room_id = ? AND usuario_id = ?",
+        [id, userActualId]
+      );
+
+      const [remaining] = await pool.query(
+        "SELECT COUNT(*) as count FROM chat_participante WHERE room_id = ?",
+        [id]
+      );
+
+      if (remaining[0].count === 0) {
+        await pool.query("DELETE FROM chat_room WHERE id = ?", [id]);
+      }
+
+      console.log("✅ Participación eliminada del chat directo");
+      return res.json({ success: true, message: "Chat eliminado para ti" });
+    }
+
+    await pool.query("DELETE FROM chat_room WHERE id = ?", [id]);
+    console.log("✅ Grupo eliminado completamente");
+    res.json({ success: true, message: "Grupo eliminado" });
+  } catch (err) {
+    console.error("❌ Error al eliminar chat:", err);
+    res.status(500).json({ error: "Error al eliminar chat" });
+  }
+});
+
+app.get("/api/chats/:id/mensajes", authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const userActualId = req.user.id;
+
+  console.log(
+    "📩 GET /api/chats/:id/mensajes - Chat:",
+    id,
+    "Usuario:",
+    userActualId
+  );
+
+  try {
+    const [permiso] = await pool.query(
+      "SELECT * FROM chat_participante WHERE room_id = ? AND usuario_id = ?",
+      [id, userActualId]
+    );
+
+    if (permiso.length === 0) {
+      console.log("⚠️ No autorizado");
+      return res.status(403).json({ error: "No autorizado" });
+    }
+
+    const [mensajes] = await pool.query(
+      `SELECT cm.id, cm.room_id as chat_id, cm.autor_id as remitente_id, 
+              cm.contenido, cm.leido, cm.fecha_envio,
+              u.nombre AS remitente_nombre, u.apellido AS remitente_apellido
+       FROM chat_mensaje cm
+       LEFT JOIN usuario u ON u.id = cm.autor_id
+       WHERE cm.room_id = ?
+       ORDER BY cm.fecha_envio ASC`,
+      [id]
+    );
+
+    console.log(`✅ ${mensajes.length} mensajes encontrados`);
+    res.json({ mensajes });
+  } catch (err) {
+    console.error("❌ Error al obtener mensajes:", err);
+    res.status(500).json({ error: "Error al obtener mensajes" });
+  }
+});
+
+app.get("/api/chats/:id/participantes", authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const userActualId = req.user.id;
+
+  console.log(
+    "👥 GET /api/chats/:id/participantes - Chat:",
+    id,
+    "Usuario:",
+    userActualId
+  );
+
+  try {
+    const [permiso] = await pool.query(
+      "SELECT * FROM chat_participante WHERE room_id = ? AND usuario_id = ?",
+      [id, userActualId]
+    );
+
+    if (permiso.length === 0) {
+      console.log("⚠️ No autorizado - Usuario no es parte del chat");
+      return res.status(403).json({ error: "No autorizado" });
+    }
+
+    console.log("✅ Usuario autorizado, buscando participantes...");
+
+    const [participantes] = await pool.query(
+      `SELECT cp.usuario_id, cp.rol, cp.fecha_union,
+              u.nombre, u.apellido, u.email
+       FROM chat_participante cp
+       LEFT JOIN usuario u ON cp.usuario_id = u.id
+       WHERE cp.room_id = ?
+       ORDER BY cp.rol DESC, u.nombre ASC`,
+      [id]
+    );
+
+    console.log(
+      `✅ ${participantes.length} participantes encontrados:`,
+      participantes
+    );
+    res.json({ success: true, participantes });
+  } catch (err) {
+    console.error("❌ Error al obtener participantes:", err);
+    console.error("❌ Stack:", err.stack);
+    res
+      .status(500)
+      .json({ error: "Error al obtener participantes", details: err.message });
+  }
+});
+
+app.post(
+  "/api/chats/:id/participantes",
+  authenticateToken,
+  async (req, res) => {
+    const { id } = req.params;
+    const { usuario_id } = req.body;
+    const userActualId = req.user.id;
+
+    console.log("➕ POST /api/chats/:id/participantes:", {
+      id,
+      usuario_id,
+      userActualId,
+    });
+
+    try {
+      const [checkAdmin] = await pool.query(
+        "SELECT rol FROM chat_participante WHERE room_id = ? AND usuario_id = ?",
+        [id, userActualId]
+      );
+
+      if (checkAdmin.length === 0 || checkAdmin[0].rol !== "admin") {
+        console.log("⚠️ Sin permisos - Solo admins pueden agregar");
+        return res
+          .status(403)
+          .json({ error: "Solo admins pueden agregar participantes" });
+      }
+
+      const [existe] = await pool.query(
+        "SELECT id FROM chat_participante WHERE room_id = ? AND usuario_id = ?",
+        [id, usuario_id]
+      );
+
+      if (existe.length > 0) {
+        return res.status(400).json({ error: "El usuario ya es participante" });
+      }
+
+      await pool.query(
+        "INSERT INTO chat_participante (room_id, usuario_id, rol, fecha_union) VALUES (?, ?, 'miembro', NOW())",
+        [id, usuario_id]
+      );
+
+      console.log("✅ Participante agregado");
+      res.json({ success: true });
+    } catch (err) {
+      console.error("❌ Error al agregar participante:", err);
+      if (err.code === "ER_DUP_ENTRY") {
+        return res.status(400).json({ error: "El usuario ya es participante" });
+      }
+      res.status(500).json({ error: "Error al agregar participante" });
+    }
+  }
+);
+
+app.put(
+  "/api/chats/:id/participantes/:usuarioId",
+  authenticateToken,
+  async (req, res) => {
+    const { id, usuarioId } = req.params;
+    const { rol } = req.body;
+    const userActualId = req.user.id;
+
+    console.log("🔄 PUT /api/chats/:id/participantes/:usuarioId:", {
+      id,
+      usuarioId,
+      rol,
+      userActualId,
+    });
+
+    try {
+      const [checkAdmin] = await pool.query(
+        "SELECT rol FROM chat_participante WHERE room_id = ? AND usuario_id = ?",
+        [id, userActualId]
+      );
+
+      if (checkAdmin.length === 0 || checkAdmin[0].rol !== "admin") {
+        console.log("⚠️ Sin permisos - Solo admins pueden cambiar roles");
+        return res
+          .status(403)
+          .json({ error: "Solo admins pueden cambiar roles" });
+      }
+
+      const [checkCreador] = await pool.query(
+        "SELECT creado_por FROM chat_room WHERE id = ?",
+        [id]
+      );
+
+      if (checkCreador.length > 0 && checkCreador[0].creado_por == usuarioId) {
+        return res
+          .status(400)
+          .json({ error: "No puedes cambiar el rol del creador del grupo" });
+      }
+
+      await pool.query(
+        "UPDATE chat_participante SET rol = ? WHERE room_id = ? AND usuario_id = ?",
+        [rol, id, usuarioId]
+      );
+
+      console.log("✅ Rol actualizado");
+      res.json({ success: true });
+    } catch (err) {
+      console.error("❌ Error al cambiar rol:", err);
+      res.status(500).json({ error: "Error al cambiar rol" });
+    }
+  }
+);
+
+app.delete(
+  "/api/chats/:id/mensajes/:messageId",
+  authenticateToken,
+  async (req, res) => {
+    const { id, messageId } = req.params;
+    const userActualId = req.user.id;
+
+    console.log("🗑️ DELETE /api/chats/:id/mensajes/:messageId:", {
+      id,
+      messageId,
+      userActualId,
+    });
+
+    try {
+      const [mensaje] = await pool.query(
+        "SELECT autor_id FROM chat_mensaje WHERE id = ? AND room_id = ?",
+        [messageId, id]
+      );
+
+      if (mensaje.length === 0) {
+        return res.status(404).json({ error: "Mensaje no encontrado" });
+      }
+
+      if (mensaje[0].autor_id !== userActualId) {
+        return res
+          .status(403)
+          .json({ error: "Solo puedes eliminar tus propios mensajes" });
+      }
+
+      await pool.query("DELETE FROM chat_mensaje WHERE id = ?", [messageId]);
+
+      console.log("✅ Mensaje eliminado");
+
+      io.emit("messageDeleted", {
+        chat_id: parseInt(id),
+        message_id: parseInt(messageId),
+      });
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("❌ Error al eliminar mensaje:", err);
+      res.status(500).json({ error: "Error al eliminar mensaje" });
+    }
+  }
+);
+
+app.delete(
+  "/api/chats/:id/participantes/:usuarioId",
+  authenticateToken,
+  async (req, res) => {
+    const { id, usuarioId } = req.params;
+    const userActualId = req.user.id;
+
+    console.log("➖ DELETE /api/chats/:id/participantes/:usuarioId:", {
+      id,
+      usuarioId,
+      userActualId,
+    });
+
+    try {
+      const [checkAdmin] = await pool.query(
+        "SELECT rol FROM chat_participante WHERE room_id = ? AND usuario_id = ?",
+        [id, userActualId]
+      );
+
+      if (checkAdmin.length === 0 || checkAdmin[0].rol !== "admin") {
+        console.log("⚠️ Sin permisos - Solo admins pueden eliminar");
+        return res
+          .status(403)
+          .json({ error: "Solo admins pueden eliminar participantes" });
+      }
+
+      const [checkCreador] = await pool.query(
+        "SELECT creado_por FROM chat_room WHERE id = ?",
+        [id]
+      );
+
+      if (checkCreador.length > 0 && checkCreador[0].creado_por == usuarioId) {
+        return res
+          .status(400)
+          .json({ error: "No puedes eliminar al creador del grupo" });
+      }
+
+      await pool.query(
+        "DELETE FROM chat_participante WHERE room_id = ? AND usuario_id = ?",
+        [id, usuarioId]
+      );
+
+      console.log("✅ Participante eliminado");
+      res.json({ success: true });
+    } catch (err) {
+      console.error("❌ Error al eliminar participante:", err);
+      res.status(500).json({ error: "Error al eliminar participante" });
+    }
+  }
+);
+
+io.on("connection", (socket) => {
+  console.log(
+    "🟢 Cliente conectado - Socket:",
+    socket.id,
+    "Usuario:",
+    socket.user?.id
+  );
+
+  socket.on("sendMessage", async (data) => {
+    try {
+      const { chat_id, content } = data;
+      const remitente_id = socket.user?.id;
+
+      console.log("📤 sendMessage:", { chat_id, content, remitente_id });
+
+      if (!remitente_id || !chat_id || !content) {
+        console.log("⚠️ Datos incompletos");
+        return;
+      }
+
+      const [permiso] = await pool.query(
+        "SELECT * FROM chat_participante WHERE room_id = ? AND usuario_id = ?",
+        [chat_id, remitente_id]
+      );
+
+      if (permiso.length === 0) {
+        console.log("⚠️ No autorizado");
+        return;
+      }
+
+      const [result] = await pool.query(
+        "INSERT INTO chat_mensaje (room_id, autor_id, contenido, leido, fecha_envio) VALUES (?, ?, ?, 0, NOW())",
+        [chat_id, remitente_id, content]
+      );
+
+      console.log("✅ Mensaje insertado ID:", result.insertId);
+
+      const [[usuario]] = await pool.query(
+        "SELECT nombre, apellido FROM usuario WHERE id = ?",
+        [remitente_id]
+      );
+
+      const nuevoMensaje = {
+        id: result.insertId,
+        chat_id: parseInt(chat_id),
+        remitente_id: parseInt(remitente_id),
+        contenido: content,
+        content: content,
+        fecha_envio: new Date(),
+        remitente_nombre: usuario?.nombre || "Usuario",
+        remitente_apellido: usuario?.apellido || "",
+      };
+
+      console.log("📡 Emitiendo mensaje:", nuevoMensaje.id);
+      io.emit("receiveMessage", nuevoMensaje);
+    } catch (err) {
+      console.error("❌ Error en sendMessage:", err);
+      console.error("❌ Stack:", err.stack);
+    }
+  });
+
+  socket.on("typing", async (data) => {
+    try {
+      const { chatId } = data;
+      const userId = socket.user?.id;
+
+      if (chatId && userId) {
+        socket.broadcast.emit("userTyping", { chatId, userId });
+      }
+    } catch (err) {
+      console.error("❌ Error en typing:", err);
+    }
+  });
+
+  socket.on("disconnect", () => {
+    console.log("🔴 Cliente desconectado - Socket:", socket.id);
+  });
 });
 
 setInterval(async () => {
