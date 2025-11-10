@@ -12,17 +12,22 @@ import multer from "multer";
 dotenv.config();
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: ["http://localhost:3000", "https://agro-nexus-pc.vercel.app"],
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || "claveultrasecreeta123";
 const JWT_EXPIRES = process.env.JWT_EXPIRES || "2h";
 
 const dbConfig = {
-  host: process.env.MYSQL_ADDON_HOST,
-  user: process.env.MYSQL_ADDON_USER,
-  password: process.env.MYSQL_ADDON_PASSWORD,
-  database: process.env.MYSQL_ADDON_DB,
+  host: "localhost",
+  user: "root",
+  password: "",
+  database: "agronexus",
 };
 
 const pool = mysql.createPool({
@@ -30,8 +35,6 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  acquireTimeout: 60000,
-  timeout: 60000,
 });
 
 const uploadsDir = path.join(process.cwd(), "uploads");
@@ -64,36 +67,13 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: process.env.URL_FRONTEND || "http://localhost:3000",
+    origin: ["http://localhost:3000", "https://agro-nexus-pc.vercel.app"],
     methods: ["GET", "POST"],
+    credentials: true,
   },
 });
 
 const usuariosConectados = new Map();
-
-io.on("connection", (socket) => {
-  console.log("Nuevo cliente conectado:", socket.id);
-
-  socket.on("registrarUsuario", (userId) => {
-    usuariosConectados.set(userId, socket.id);
-  });
-
-  socket.on("enviarMensaje", ({ roomId, mensaje }) => {
-    io.to(roomId.toString()).emit("nuevoMensaje", mensaje);
-  });
-
-  socket.on("unirseSala", (roomId) => {
-    socket.join(roomId.toString());
-  });
-
-  socket.on("disconnect", () => {
-    for (let [userId, sockId] of usuariosConectados.entries()) {
-      if (sockId === socket.id) {
-        usuariosConectados.delete(userId);
-      }
-    }
-  });
-});
 
 async function getGrupoRole(userId, grupoId) {
   const [rows] = await pool.execute(
@@ -2003,15 +1983,37 @@ io.on("connection", (socket) => {
     socket.user?.id
   );
 
+  // Registrar usuario conectado
+  socket.on("registrarUsuario", (userId) => {
+    usuariosConectados.set(userId, socket.id);
+    console.log("✅ Usuario registrado:", userId, "con socket:", socket.id);
+  });
+
+  // Unirse a una sala de chat
+  socket.on("unirseSala", (roomId) => {
+    socket.join(roomId.toString());
+    console.log("✅ Usuario", socket.user?.id, "se unió a la sala:", roomId);
+  });
+
+  // Enviar mensaje
   socket.on("sendMessage", async (data) => {
     try {
       const { chat_id, content } = data;
       const remitente_id = socket.user?.id;
 
-      console.log("📤 sendMessage:", { chat_id, content, remitente_id });
+      console.log("📤 sendMessage recibido:", {
+        chat_id,
+        content,
+        remitente_id,
+      });
 
       if (!remitente_id || !chat_id || !content) {
-        console.log("⚠️ Datos incompletos");
+        console.log("⚠️ Datos incompletos:", {
+          remitente_id,
+          chat_id,
+          content,
+        });
+        socket.emit("error", { message: "Datos incompletos" });
         return;
       }
 
@@ -2021,7 +2023,13 @@ io.on("connection", (socket) => {
       );
 
       if (permiso.length === 0) {
-        console.log("⚠️ No autorizado");
+        console.log(
+          "⚠️ Usuario no autorizado:",
+          remitente_id,
+          "en chat:",
+          chat_id
+        );
+        socket.emit("error", { message: "No autorizado" });
         return;
       }
 
@@ -2030,7 +2038,8 @@ io.on("connection", (socket) => {
         [chat_id, remitente_id, content]
       );
 
-      console.log("✅ Mensaje insertado ID:", result.insertId);
+      const mensajeId = result.insertId;
+      console.log("✅ Mensaje insertado en BD con ID:", mensajeId);
 
       const [[usuario]] = await pool.query(
         "SELECT nombre, apellido FROM usuario WHERE id = ?",
@@ -2038,21 +2047,31 @@ io.on("connection", (socket) => {
       );
 
       const nuevoMensaje = {
-        id: result.insertId,
+        id: mensajeId,
         chat_id: parseInt(chat_id),
+        room_id: parseInt(chat_id),
         remitente_id: parseInt(remitente_id),
+        autor_id: parseInt(remitente_id),
         contenido: content,
         content: content,
         fecha_envio: new Date(),
+        leido: 0,
         remitente_nombre: usuario?.nombre || "Usuario",
         remitente_apellido: usuario?.apellido || "",
+        nombre: usuario?.nombre || "Usuario",
+        apellido: usuario?.apellido || "",
       };
 
-      console.log("📡 Emitiendo mensaje:", nuevoMensaje.id);
+      console.log("📡 Emitiendo mensaje a todos:", nuevoMensaje.id);
+
       io.emit("receiveMessage", nuevoMensaje);
+      io.to(chat_id.toString()).emit("nuevoMensaje", nuevoMensaje);
+
+      console.log("✅ Mensaje emitido exitosamente");
     } catch (err) {
       console.error("❌ Error en sendMessage:", err);
       console.error("❌ Stack:", err.stack);
+      socket.emit("error", { message: "Error al enviar mensaje" });
     }
   });
 
@@ -2062,6 +2081,7 @@ io.on("connection", (socket) => {
       const userId = socket.user?.id;
 
       if (chatId && userId) {
+        console.log("✍️ Usuario", userId, "escribiendo en chat", chatId);
         socket.broadcast.emit("userTyping", { chatId, userId });
       }
     } catch (err) {
@@ -2071,6 +2091,13 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     console.log("🔴 Cliente desconectado - Socket:", socket.id);
+
+    for (let [userId, sockId] of usuariosConectados.entries()) {
+      if (sockId === socket.id) {
+        usuariosConectados.delete(userId);
+        console.log("🔴 Usuario", userId, "eliminado de conexiones activas");
+      }
+    }
   });
 });
 
